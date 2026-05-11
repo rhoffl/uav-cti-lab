@@ -1,0 +1,112 @@
+---
+# ansible/roles/ids-monitor/tasks/main.yml
+# Installs Suricata 6.x + Zeek 5.x + Arkime on the ids-monitor VM
+#
+# Citation [7]: Birnbaum et al. (2016) "Unmanned Aerial Vehicle Security
+#   Using Recursive Parameter Estimation." ICUAS 2016.
+# Citation [6]: Rodday et al. (2016) "MAVLink vulnerability analysis."
+#   IEEE NOMS 2016.
+
+# ── Suricata ────────────────────────────────────────────────────
+- name: Add Suricata PPA
+  apt_repository:
+    repo: ppa:oisf/suricata-stable
+    state: present
+
+- name: Install Suricata
+  apt:
+    name: suricata
+    state: present
+    update_cache: yes
+
+- name: Deploy custom UAV Suricata rules
+  copy:
+    src: ../../../docker/configs/suricata/rules/uav-cti.rules
+    dest: /etc/suricata/rules/uav-cti.rules
+    mode: "0644"
+
+- name: Configure Suricata
+  template:
+    src: suricata.yaml.j2
+    dest: /etc/suricata/suricata.yaml
+    mode: "0644"
+  notify: reload suricata
+
+- name: Enable Suricata service
+  systemd:
+    name: suricata
+    enabled: yes
+    state: started
+
+# ── Zeek ────────────────────────────────────────────────────────
+- name: Add Zeek apt repository
+  shell: |
+    echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /' \
+      | tee /etc/apt/sources.list.d/security:zeek.list
+    curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key \
+      | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+    apt-get update
+
+- name: Install Zeek
+  apt:
+    name: zeek-lts
+    state: present
+    update_cache: yes
+
+- name: Deploy MAVLink Zeek script
+  copy:
+    src: ../../../docker/configs/zeek/scripts/mavlink-monitor.zeek
+    dest: /opt/zeek/share/zeek/site/mavlink-monitor.zeek
+    mode: "0644"
+
+- name: Load custom scripts in local.zeek
+  lineinfile:
+    path: /opt/zeek/share/zeek/site/local.zeek
+    line: "@load site/mavlink-monitor"
+
+- name: Enable Zeek service
+  systemd:
+    name: zeek
+    enabled: yes
+    state: started
+
+# ── Filebeat (ships logs to Elasticsearch) ──────────────────────
+- name: Add Elastic apt key
+  apt_key:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    state: present
+
+- name: Add Elastic repository
+  apt_repository:
+    repo: "deb https://artifacts.elastic.co/packages/8.x/apt stable main"
+    state: present
+
+- name: Install Filebeat
+  apt:
+    name: filebeat
+    state: present
+    update_cache: yes
+
+- name: Configure Filebeat to ship to SIEM
+  template:
+    src: filebeat.yml.j2
+    dest: /etc/filebeat/filebeat.yml
+    mode: "0644"
+
+- name: Enable Suricata and Zeek Filebeat modules
+  command: "filebeat modules enable {{ item }}"
+  loop:
+    - suricata
+    - zeek
+
+- name: Enable Filebeat
+  systemd:
+    name: filebeat
+    enabled: yes
+    state: started
+
+handlers:
+  - name: reload suricata
+    service:
+      name: suricata
+      state: reloaded

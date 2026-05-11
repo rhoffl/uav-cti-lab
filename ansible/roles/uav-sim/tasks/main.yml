@@ -1,0 +1,156 @@
+---
+# ansible/roles/uav-sim/tasks/main.yml
+# Installs ArduPilot SITL + MAVLink Router on the uav-sim VM
+#
+# Citation [6]: Rodday et al. (2016) "Exploring Security Vulnerabilities of
+#   Unmanned Aerial Vehicles." IEEE NOMS 2016. doi:10.1109/NOMS.2016.7502939
+# Citation [7]: Birnbaum et al. (2016) "UAV Security Using Recursive
+#   Parameter Estimation." ICUAS 2016. doi:10.1109/ICUAS.2016.7502512
+
+- name: Install ArduPilot build dependencies
+  apt:
+    name:
+      - gcc
+      - g++
+      - make
+      - cmake
+      - python3-pip
+      - python3-dev
+      - libxml2-dev
+      - libxslt1-dev
+      - python3-wxgtk4.0
+      - python3-lxml
+      - python3-matplotlib
+      - python3-numpy
+      - python3-scipy
+      - libpython3-dev
+      - git
+      - screen
+    state: present
+
+- name: Install Python MAVLink libraries
+  pip:
+    name:
+      - pymavlink
+      - mavproxy
+      - dronekit
+      - dronekit-sitl
+    executable: pip3
+
+- name: Clone ArduPilot repository (latest stable)
+  git:
+    repo: https://github.com/ArduPilot/ardupilot.git
+    dest: /opt/ardupilot
+    version: Copter-4.5
+    depth: 1
+    recursive: yes
+  become_user: vagrant
+
+- name: Install ArduPilot python requirements
+  pip:
+    requirements: /opt/ardupilot/Tools/environment_install/requirements.txt
+    executable: pip3
+
+- name: Build ArduCopter SITL binary
+  command:
+    cmd: python3 waf configure --board sitl
+    chdir: /opt/ardupilot
+  become_user: vagrant
+
+- name: Compile SITL
+  command:
+    cmd: python3 waf copter
+    chdir: /opt/ardupilot
+  become_user: vagrant
+
+- name: Install MAVLink Router
+  block:
+    - name: Clone mavlink-router
+      git:
+        repo: https://github.com/mavlink-router/mavlink-router.git
+        dest: /opt/mavlink-router
+        depth: 1
+
+    - name: Build mavlink-router
+      shell: |
+        cd /opt/mavlink-router
+        git submodule update --init --recursive
+        meson setup build .
+        ninja -C build install
+
+- name: Create SITL systemd service
+  copy:
+    dest: /etc/systemd/system/ardupilot-sitl.service
+    content: |
+      [Unit]
+      Description=ArduPilot Copter SITL Simulator
+      After=network.target
+
+      [Service]
+      User=vagrant
+      WorkingDirectory=/opt/ardupilot
+      ExecStart=/opt/ardupilot/Tools/autotest/sim_vehicle.py \
+        -v ArduCopter \
+        --out udp:0.0.0.0:14550 \
+        --out udp:0.0.0.0:14551 \
+        --no-rebuild \
+        --console
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Create MAVLink router config
+  copy:
+    dest: /etc/mavlink-router/main.conf
+    content: |
+      [UdpEndpoint gcs-linux]
+      Mode = Normal
+      Address = 192.168.100.11
+      Port = 14550
+
+      [UdpEndpoint ids-monitor]
+      Mode = Normal
+      Address = 192.168.100.30
+      Port = 14555
+
+      [UdpEndpoint cti-mavids]
+      Mode = Normal
+      Address = 192.168.100.50
+      Port = 14556
+
+- name: Create MAVLink router systemd service
+  copy:
+    dest: /etc/systemd/system/mavlink-router.service
+    content: |
+      [Unit]
+      Description=MAVLink Router
+      After=ardupilot-sitl.service
+
+      [Service]
+      ExecStart=/usr/local/bin/mavlink-routerd -c /etc/mavlink-router/main.conf
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable SITL and router services
+  systemd:
+    name: "{{ item }}"
+    enabled: yes
+    daemon_reload: yes
+  loop:
+    - ardupilot-sitl.service
+    - mavlink-router.service
+
+- name: Open MAVLink ports in UFW
+  ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: udp
+  loop:
+    - "14550"
+    - "14551"
+    - "14555"
+    - "14556"

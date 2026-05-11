@@ -1,0 +1,81 @@
+---
+# ansible/roles/cti-platform/tasks/main.yml
+# Deploys OpenCTI + MISP + TheHive on the cti-platform VM
+#
+# Citation [11]: OASIS (2021). "STIX Version 2.1." OASIS Standard.
+# Citation [12]: Schlette et al. (2021). "Comparative Study on CTI."
+#                IEEE Communications Surveys 23(4). doi:10.1109/COMST.2021.3117338
+# Citation [21]: Mavroeidis & Bromander (2017). "Cyber Threat Intelligence
+#                Model." EISIC 2017. doi:10.1109/EISIC.2017.20
+
+- name: Create CTI platform directory
+  file:
+    path: /opt/uav-cti
+    state: directory
+    owner: vagrant
+    group: vagrant
+    mode: "0755"
+
+- name: Copy CTI Docker Compose stack
+  copy:
+    src: ../../../docker/stacks/cti.yml
+    dest: /opt/uav-cti/docker-compose.yml
+    owner: vagrant
+    group: vagrant
+
+- name: Copy environment file
+  copy:
+    src: ../../../.env
+    dest: /opt/uav-cti/.env
+    owner: vagrant
+    group: vagrant
+    mode: "0600"
+
+- name: Copy OpenCTI configuration
+  copy:
+    src: ../../../docker/configs/opencti/
+    dest: /opt/uav-cti/opencti/
+    owner: vagrant
+    group: vagrant
+
+- name: Pull CTI stack images
+  command:
+    cmd: docker compose pull
+    chdir: /opt/uav-cti
+  become_user: vagrant
+
+- name: Start CTI stack
+  command:
+    cmd: docker compose up -d
+    chdir: /opt/uav-cti
+  become_user: vagrant
+
+- name: Allow CTI ports in UFW
+  ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+    src: 192.168.100.0/24
+  loop:
+    - "8080"   # OpenCTI
+    - "8090"   # MISP
+    - "9000"   # TheHive
+    - "9001"   # Cortex
+    - "5672"   # RabbitMQ AMQP
+    - "15672"  # RabbitMQ Management
+
+- name: Wait for OpenCTI to be ready
+  uri:
+    url: "http://localhost:8080/health"
+    status_code: 200
+  register: result
+  until: result.status == 200
+  retries: 30
+  delay: 10
+
+- name: Import UAV MISP taxonomies
+  command:
+    cmd: python3 /opt/uav-cti/scripts/import_feeds.py --feeds uav-threats,ics-cert
+    chdir: /opt/uav-cti
+  become_user: vagrant
+  ignore_errors: yes   # feeds may not be reachable in offline lab

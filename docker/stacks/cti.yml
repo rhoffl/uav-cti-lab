@@ -1,0 +1,261 @@
+# ============================================================
+# UAV CTI Lab — CTI Platform Stack
+# Services: OpenCTI + MISP + TheHive + Cortex + supporting DBs
+#
+# Citation [11]: OASIS (2021). STIX 2.1 Standard.
+# Citation [12]: Schlette et al. (2021). IEEE Comms Surveys 23(4).
+# ============================================================
+version: "3.8"
+
+x-opencti-env: &opencti-env
+  NODE_OPTIONS: "--max-old-space-size=8096"
+  APP__PORT: 8080
+  APP__BASE_URL: ${OPENCTI_BASE_URL}
+  APP__ADMIN__EMAIL: ${OPENCTI_ADMIN_EMAIL}
+  APP__ADMIN__PASSWORD: ${OPENCTI_ADMIN_PASSWORD}
+  APP__ADMIN__TOKEN: ${OPENCTI_ADMIN_TOKEN}
+  APP__APP_LOGS__LOGS_LEVEL: error
+  REDIS__HOSTNAME: redis
+  REDIS__PORT: 6379
+  ELASTICSEARCH__URL: http://elasticsearch:9200
+  ELASTICSEARCH__USERNAME: elastic
+  ELASTICSEARCH__PASSWORD: ${ELASTIC_PASSWORD}
+  MINIO__ENDPOINT: minio
+  MINIO__PORT: 9000
+  MINIO__USE_SSL: "false"
+  MINIO__ACCESS_KEY: opencti
+  MINIO__SECRET_KEY: ${OPENCTI_ADMIN_PASSWORD}
+  RABBITMQ__HOSTNAME: rabbitmq
+  RABBITMQ__PORT: 5672
+  RABBITMQ__USERNAME: ${RABBITMQ_DEFAULT_USER}
+  RABBITMQ__PASSWORD: ${RABBITMQ_DEFAULT_PASS}
+  SMTP__HOSTNAME: localhost
+  PROVIDERS__LOCAL__STRATEGY: LocalStrategy
+
+services:
+
+  # ── OpenCTI Platform ─────────────────────────────────────────
+  opencti:
+    image: opencti/platform:5.12.0
+    environment:
+      <<: *opencti-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - elasticsearch
+      - minio
+      - rabbitmq
+    restart: unless-stopped
+    networks:
+      - cti-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ── OpenCTI Worker ────────────────────────────────────────────
+  worker:
+    image: opencti/worker:5.12.0
+    environment:
+      OPENCTI_URL: http://opencti:8080
+      OPENCTI_TOKEN: ${OPENCTI_ADMIN_TOKEN}
+      WORKER_LOG_LEVEL: error
+    depends_on:
+      - opencti
+    deploy:
+      mode: replicated
+      replicas: 3
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── OpenCTI MITRE ATT&CK Connector ───────────────────────────
+  # Imports MITRE ATT&CK for ICS — directly relevant to UAV threats [10]
+  connector-mitre:
+    image: opencti/connector-mitre:5.12.0
+    environment:
+      OPENCTI_URL: http://opencti:8080
+      OPENCTI_TOKEN: ${OPENCTI_ADMIN_TOKEN}
+      CONNECTOR_ID: mitre-connector
+      CONNECTOR_TYPE: EXTERNAL_IMPORT
+      CONNECTOR_NAME: "MITRE ATT&CK"
+      CONNECTOR_SCOPE: "marking-definition,identity,attack-pattern,course-of-action,intrusion-set,campaign,malware,tool,vulnerability,x-mitre-data-component,x-mitre-data-source"
+      CONNECTOR_RUN_AND_TERMINATE: "false"
+      CONNECTOR_LOG_LEVEL: error
+      MITRE_REMOVE_STATEMENT_MARKING: "true"
+      MITRE_INTERVAL: 7
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── OpenCTI CISA Known Exploited Vulnerabilities Connector ────
+  connector-cisa-kev:
+    image: opencti/connector-cisa-known-exploited-vulnerabilities:5.12.0
+    environment:
+      OPENCTI_URL: http://opencti:8080
+      OPENCTI_TOKEN: ${OPENCTI_ADMIN_TOKEN}
+      CONNECTOR_ID: cisa-kev-connector
+      CONNECTOR_TYPE: EXTERNAL_IMPORT
+      CONNECTOR_NAME: "CISA KEV"
+      CONNECTOR_LOG_LEVEL: error
+      CISA_CATALOG_URL: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+      CISA_INTERVAL: 86400
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── MISP ──────────────────────────────────────────────────────
+  # Malware Information Sharing Platform — threat intelligence hub
+  # Shares IoCs in STIX 2.1 format via TAXII [11]
+  misp:
+    image: coolacid/misp-docker:core-latest
+    environment:
+      - MISP_ADMIN_EMAIL=${MISP_ADMIN_EMAIL}
+      - MISP_ADMIN_PASSPHRASE=${MISP_ADMIN_PASSWORD}
+      - MISP_BASEURL=http://misp:80
+      - MYSQL_HOST=misp-db
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MISP_ADMIN_PASSWORD}
+    ports:
+      - "8090:80"
+    depends_on:
+      - misp-db
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  misp-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MISP_ADMIN_PASSWORD}
+      MYSQL_DATABASE: misp
+      MYSQL_USER: misp
+      MYSQL_PASSWORD: ${MISP_ADMIN_PASSWORD}
+    volumes:
+      - misp-db-data:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  misp-modules:
+    image: coolacid/misp-docker:modules-latest
+    depends_on:
+      - misp
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── TheHive 5 ─────────────────────────────────────────────────
+  # Incident response case management
+  thehive:
+    image: strangebee/thehive:5
+    environment:
+      - JVM_OPTS=-Xms512m -Xmx1024m
+    depends_on:
+      - cassandra
+      - elasticsearch
+      - minio
+    ports:
+      - "9000:9000"
+    volumes:
+      - thehive-data:/opt/thp/thehive/data
+      - ./configs/opencti/thehive-application.conf:/etc/thehive/application.conf:ro
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── Cortex 3 ──────────────────────────────────────────────────
+  # Automated threat analysis engine — enriches CTI observables
+  cortex:
+    image: thehiveproject/cortex:3
+    environment:
+      - JVM_OPTS=-Xms512m -Xmx1024m
+      - CORTEX_SECRET=${CORTEX_SECRET}
+    depends_on:
+      - elasticsearch
+    ports:
+      - "9001:9001"
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  # ── Supporting infrastructure ─────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9002"
+    environment:
+      MINIO_ROOT_USER: opencti
+      MINIO_ROOT_PASSWORD: ${OPENCTI_ADMIN_PASSWORD}
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+  cassandra:
+    image: cassandra:4.1
+    environment:
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 1G
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    restart: unless-stopped
+    networks:
+      - cti-net
+
+volumes:
+  es-data:
+  redis-data:
+  minio-data:
+  rabbitmq-data:
+  cassandra-data:
+  thehive-data:
+  misp-db-data:
+
+networks:
+  cti-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

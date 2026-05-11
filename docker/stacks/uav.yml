@@ -1,0 +1,93 @@
+# ============================================================
+# UAV CTI Lab — UAV Simulation Stack
+# Services: ArduPilot SITL + MAVLink Router + MAVLink IDS
+#
+# Citation [6]: Rodday et al. (2016) "Exploring Security Vulnerabilities
+#   of Unmanned Aerial Vehicles." IEEE NOMS 2016.
+# ============================================================
+version: "3.8"
+
+services:
+
+  # ── ArduPilot SITL ────────────────────────────────────────────
+  # Software-in-the-loop copter simulation; no physical UAV needed.
+  # Exposes standard MAVLink telemetry on UDP 14550.
+  ardupilot-sitl:
+    image: ardupilot/ardupilot-dev:latest
+    command: >
+      python3 Tools/autotest/sim_vehicle.py
+      -v ArduCopter
+      --out udp:0.0.0.0:14550
+      --out udp:mavlink-router:14551
+      --no-rebuild
+    ports:
+      - "14550:14550/udp"
+      - "14551:14551/udp"
+    volumes:
+      - ardupilot-params:/opt/ardupilot/Tools/autotest/default_params
+    restart: unless-stopped
+    networks:
+      - uav-net
+
+  # ── MAVLink Router ────────────────────────────────────────────
+  # Distributes telemetry stream to GCS, IDS, and monitoring endpoints
+  mavlink-router:
+    image: mavlink/mavlink-router:latest
+    command: >
+      mavlink-routerd
+      -e gcs-linux:14550
+      -e ids-monitor:14555
+      -e mavlink-ids:14556
+      0.0.0.0:14551
+    network_mode: host
+    depends_on:
+      - ardupilot-sitl
+    restart: unless-stopped
+
+  # ── MAVLink IDS (custom Python service) ───────────────────────
+  # CTI-informed intrusion detection for MAVLink protocol streams.
+  # Pulls IoCs from OpenCTI and detects anomalous MAVLink messages.
+  # Source: scripts/detection/mavlink_ids.py
+  mavlink-ids:
+    build:
+      context: ../../scripts/detection
+      dockerfile: Dockerfile.mavlink-ids
+    environment:
+      - OPENCTI_URL=http://cti-platform:8080
+      - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - MAV_LISTEN_HOST=0.0.0.0
+      - MAV_LISTEN_PORT=14556
+      - ELASTIC_URL=http://elasticsearch:9200
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - LOG_LEVEL=INFO
+    ports:
+      - "14556:14556/udp"
+    depends_on:
+      - ardupilot-sitl
+    restart: unless-stopped
+    networks:
+      - uav-net
+
+  # ── GPSD ──────────────────────────────────────────────────────
+  # GPS daemon — bridges SDR-generated GPS signals to ArduPilot SITL.
+  # When SDR is unavailable, uses simulated NMEA sentences.
+  gpsd:
+    image: alpine:latest
+    command: >
+      sh -c "apk add --no-cache gpsd gpsd-clients &&
+             gpsd -N -n -G /dev/ttyUSB0 || gpsd -N -n -G tcp://gps-sim:2948"
+    ports:
+      - "2947:2947"
+    restart: unless-stopped
+    networks:
+      - uav-net
+
+volumes:
+  ardupilot-params:
+
+networks:
+  uav-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24

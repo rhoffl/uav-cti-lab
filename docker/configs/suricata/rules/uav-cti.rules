@@ -1,0 +1,182 @@
+# ============================================================
+# UAV CTI Lab — Suricata Custom Detection Rules
+# File: docker/configs/suricata/rules/uav-cti.rules
+#
+# DEFENSIVE PURPOSE ONLY — These signatures detect known UAV
+# attack patterns to support CTI research and defense.
+#
+# Citations:
+#  [6]  Rodday et al. (2016) MAVLink vulnerabilities. IEEE NOMS 2016.
+#  [7]  Birnbaum et al. (2016) UAV anomaly detection. ICUAS 2016.
+#  [13] Humphreys et al. (2008) GPS spoofing detection. ION GNSS.
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Category 1: MAVLink Protocol Anomalies
+# MAVLink is the dominant UAV telemetry protocol [6].
+# These rules detect abnormal message patterns indicating
+# unauthorized command injection or replay attacks.
+# ─────────────────────────────────────────────────────────────
+
+# Detect MAVLink v1 HEARTBEAT flood — potential DoS precursor
+# MAVLink magic byte 0xFE = v1, 0xFD = v2
+alert udp any any -> $HOME_NETS 14550 \
+    (msg:"UAV MAVLink v1 HEARTBEAT Flood - Possible DoS"; \
+     content:"|FE|"; depth:1; \
+     threshold: type threshold, track by_src, count 100, seconds 10; \
+     classtype:attempted-dos; \
+     reference:url,github.com/ArduPilot/ardupilot/security; \
+     sid:9100001; rev:3;)
+
+# Detect MAVLink v2 HEARTBEAT flood
+alert udp any any -> $HOME_NETS 14550 \
+    (msg:"UAV MAVLink v2 HEARTBEAT Flood - Possible DoS"; \
+     content:"|FD|"; depth:1; \
+     threshold: type threshold, track by_src, count 100, seconds 10; \
+     classtype:attempted-dos; \
+     sid:9100002; rev:2;)
+
+# Detect COMMAND_LONG from unauthorized source
+# Message ID 76 (0x4C) = COMMAND_LONG in MAVLink
+alert udp !$AUTHORIZED_GCS any -> $HOME_NETS 14550 \
+    (msg:"UAV MAVLink Unauthorized COMMAND_LONG from unknown host"; \
+     content:"|FE|"; depth:1; \
+     content:"|4C|"; offset:5; depth:1; \
+     classtype:policy-violation; \
+     metadata:tactic Execution, technique T0836; \
+     sid:9100003; rev:4;)
+
+# Detect SET_MODE from unauthorized source (flight mode change)
+# Message ID 11 (0x0B) = SET_MODE
+alert udp !$AUTHORIZED_GCS any -> $HOME_NETS 14550 \
+    (msg:"UAV MAVLink Unauthorized SET_MODE Command Injection"; \
+     content:"|FE|"; depth:1; \
+     content:"|0B|"; offset:5; depth:1; \
+     classtype:policy-violation; \
+     metadata:tactic Execution, technique T0836; \
+     reference:paper,Rodday-2016-IEEE-NOMS; \
+     sid:9100004; rev:3;)
+
+# Detect rapid waypoint injection (>10 SET_POSITION_TARGET per 5s)
+# Message ID 84 (0x54) = SET_POSITION_TARGET_GLOBAL_INT
+alert udp any any -> $HOME_NETS 14550 \
+    (msg:"UAV MAVLink Rapid Waypoint Injection Attempt"; \
+     content:"|FE|"; depth:1; \
+     content:"|54|"; offset:5; depth:1; \
+     threshold: type threshold, track by_src, count 10, seconds 5; \
+     classtype:policy-violation; \
+     sid:9100005; rev:2;)
+
+# ─────────────────────────────────────────────────────────────
+# Category 2: GPS Anomaly Detection
+# GPS spoofing is a critical UAV attack vector [13].
+# These rules trigger on anomalous GPSD output patterns.
+# ─────────────────────────────────────────────────────────────
+
+# Detect GPSD reporting extreme position jump (likely spoofing)
+# Matches lat/lon values that differ by >1 degree in consecutive reports
+alert tcp any 2947 -> $HOME_NETS any \
+    (msg:"UAV GPSD Anomalous Position Jump - Possible GPS Spoofing"; \
+     content:"TPV"; \
+     pcre:"/\"lat\":\s*-?[0-9]{3,}/"; \
+     classtype:suspicious-login; \
+     metadata:tactic RF-Domain-Manipulation, technique GPS-Spoof; \
+     reference:paper,Humphreys-2008-ION-GNSS; \
+     sid:9100010; rev:3;)
+
+# Detect sudden GPS fix loss followed by immediate re-acquisition
+alert tcp any 2947 -> $HOME_NETS any \
+    (msg:"UAV GPSD Fix Loss then Immediate Re-Acquisition - Spoof Indicator"; \
+     content:"\"status\":0"; \
+     within:100; \
+     content:"\"status\":2"; \
+     classtype:suspicious-login; \
+     sid:9100011; rev:2;)
+
+# Detect GPS satellites reporting abnormally high signal strength
+# C/N0 > 55 dB-Hz is anomalous for civilian GPS
+alert tcp any 2947 -> $HOME_NETS any \
+    (msg:"UAV GPSD Abnormal Signal Strength - Spoofing Indicator"; \
+     content:"\"ss\":"; \
+     pcre:"/\"ss\":\s*[6-9][0-9]/"; \
+     classtype:suspicious-login; \
+     reference:paper,Humphreys-2008-ION-GNSS; \
+     sid:9100012; rev:2;)
+
+# ─────────────────────────────────────────────────────────────
+# Category 3: GCS Host-Based Indicators
+# Ground Control Station malware targeting [8]
+# ─────────────────────────────────────────────────────────────
+
+# Detect GCS connecting to known malicious C2 infrastructure
+# (populated from OpenCTI/MISP CTI feeds at runtime)
+alert tcp $GCS_NETS any -> $THREAT_INTEL_IPS any \
+    (msg:"UAV GCS Malware - CTI-Matched C2 Communication"; \
+     classtype:trojan-activity; \
+     metadata:source OpenCTI, tactic Command-And-Control; \
+     sid:9100020; rev:5;)
+
+# Detect GCS beaconing — regular small outbound connections
+alert tcp $GCS_NETS any -> !$HOME_NETS any \
+    (msg:"UAV GCS Potential Beacon - Regular Small Outbound Traffic"; \
+     flow:established,to_server; \
+     dsize:50<>200; \
+     threshold: type both, track by_src, count 5, seconds 60; \
+     classtype:trojan-activity; \
+     sid:9100021; rev:3;)
+
+# Detect MAVLink data exfiltration over non-standard port
+alert tcp $GCS_NETS any -> !$HOME_NETS !14550 \
+    (msg:"UAV Telemetry Data Possible Exfiltration - Non-standard port"; \
+     content:"|FE|"; depth:1; \
+     classtype:policy-violation; \
+     sid:9100022; rev:2;)
+
+# ─────────────────────────────────────────────────────────────
+# Category 4: Network Reconnaissance
+# Pre-attack reconnaissance against UAV infrastructure
+# ─────────────────────────────────────────────────────────────
+
+# Detect port scan targeting MAVLink ports
+alert tcp any any -> $HOME_NETS 14550:14560 \
+    (msg:"UAV MAVLink Port Scan Detected"; \
+     flags:S; \
+     threshold: type threshold, track by_src, count 5, seconds 10; \
+     classtype:network-scan; \
+     sid:9100030; rev:2;)
+
+# Detect UDP sweep across MAVLink range
+alert udp any any -> $HOME_NETS 14550:14560 \
+    (msg:"UAV MAVLink UDP Port Sweep"; \
+     threshold: type threshold, track by_src, count 5, seconds 5; \
+     classtype:network-scan; \
+     sid:9100031; rev:2;)
+
+# ─────────────────────────────────────────────────────────────
+# Category 5: Supply Chain / Firmware Indicators
+# Anomalous firmware download activity
+# ─────────────────────────────────────────────────────────────
+
+# Detect GCS requesting firmware from unofficial source
+alert tcp $GCS_NETS any -> !$APPROVED_FW_SERVERS 80 \
+    (msg:"UAV GCS Firmware Download from Unofficial Server"; \
+     content:"GET"; http_method; \
+     content:".apj"; http_uri; \
+     classtype:policy-violation; \
+     metadata:tactic Supply-Chain, technique T0839; \
+     sid:9100040; rev:2;)
+
+alert tcp $GCS_NETS any -> !$APPROVED_FW_SERVERS 443 \
+    (msg:"UAV GCS Firmware Download from Unofficial Server (TLS)"; \
+     tls.sni; content:".apj"; \
+     classtype:policy-violation; \
+     sid:9100041; rev:1;)
+
+# ─────────────────────────────────────────────────────────────
+# Suricata Variables (define in suricata.yaml vars section)
+#
+#  AUTHORIZED_GCS: "[192.168.100.10, 192.168.100.11]"
+#  GCS_NETS:       "[192.168.100.10/32, 192.168.100.11/32]"
+#  THREAT_INTEL_IPS: populated from CTI feed (auto-updated)
+#  APPROVED_FW_SERVERS: "[firmware.ardupilot.org, 10.0.0.0/8]"
+# ─────────────────────────────────────────────────────────────

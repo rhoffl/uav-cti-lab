@@ -1,0 +1,172 @@
+# ============================================================
+# UAV CTI Lab — Monitoring & Detection Stack
+# Services: Suricata + Zeek + Elastic SIEM + Grafana + ntopng
+#
+# Citation [7]: Birnbaum et al. (2016) "UAV anomaly detection."
+#               ICUAS 2016. doi:10.1109/ICUAS.2016.7502512
+# Citation [6]: Rodday et al. (2016) "MAVLink vulnerabilities."
+#               IEEE NOMS 2016. doi:10.1109/NOMS.2016.7502939
+# ============================================================
+version: "3.8"
+
+services:
+
+  # ── Suricata IDS ──────────────────────────────────────────────
+  # Network intrusion detection with 47 custom UAV rules
+  suricata:
+    image: jasonish/suricata:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - ./configs/suricata/rules:/etc/suricata/rules:ro
+      - suricata-logs:/var/log/suricata
+      - ./configs/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+    command: >
+      -i eth0
+      --set stats.enabled=yes
+      --set outputs.1.eve-log.enabled=yes
+      --set outputs.1.eve-log.filetype=regular
+    restart: unless-stopped
+    networks: []
+
+  # ── Zeek NSM ──────────────────────────────────────────────────
+  # Network Security Monitor with MAVLink protocol analyzer
+  zeek:
+    image: zeek/zeek:latest
+    network_mode: host
+    volumes:
+      - ./configs/zeek/scripts:/usr/local/zeek/share/zeek/site:ro
+      - zeek-logs:/usr/local/zeek/logs
+    command: >
+      zeek -i eth0
+      -C
+      local
+    restart: unless-stopped
+    networks: []
+
+  # ── Arkime Full Packet Capture ────────────────────────────────
+  arkime:
+    image: ghcr.io/arkime/arkime:main
+    network_mode: host
+    environment:
+      ARKIME_ELASTICSEARCH: http://elasticsearch:9200
+      ARKIME_ADMIN_PASSWORD: ${ELASTIC_PASSWORD}
+    volumes:
+      - arkime-pcap:/data/pcap
+    ports:
+      - "8005:8005"
+    restart: unless-stopped
+    networks: []
+
+  # ── Elasticsearch ─────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.12.2}
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - "ES_JAVA_OPTS=-Xms4g -Xmx4g"
+      - xpack.ml.enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-monitor-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    restart: unless-stopped
+    networks:
+      - monitor-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  # ── Logstash ──────────────────────────────────────────────────
+  # Ingests logs from Suricata, Zeek, MAVLink IDS, GPSD
+  logstash:
+    image: docker.elastic.co/logstash/logstash:${ELASTIC_VERSION:-8.12.2}
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - "LS_JAVA_OPTS=-Xms1g -Xmx1g"
+    volumes:
+      - ./configs/logstash/pipelines:/usr/share/logstash/pipeline:ro
+      - suricata-logs:/var/log/suricata:ro
+      - zeek-logs:/usr/local/zeek/logs:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - monitor-net
+
+  # ── Kibana ────────────────────────────────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-8.12.2}
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - XPACK_SECURITY_ENABLED=true
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - monitor-net
+
+  # ── Grafana ───────────────────────────────────────────────────
+  # Operational metrics: MTTD, MTTR, detection rate dashboards
+  grafana:
+    image: grafana/grafana:10.3.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+    networks:
+      - monitor-net
+
+  # ── ntopng ────────────────────────────────────────────────────
+  # Real-time network traffic analysis and flow monitoring
+  ntopng:
+    image: ntop/ntopng:stable
+    network_mode: host
+    command: >
+      --interface=eth0
+      --http-port=3000
+      --community
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks: []
+
+volumes:
+  es-monitor-data:
+  suricata-logs:
+  zeek-logs:
+  arkime-pcap:
+  grafana-data:
+
+networks:
+  monitor-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24

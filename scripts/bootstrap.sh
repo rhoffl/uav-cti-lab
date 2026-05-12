@@ -95,11 +95,11 @@ apt-get install -y -qq \
 
 # Python packages for CTI scripts
 python3 -m pip install --break-system-packages \
-    requests pymavlink pyopencti pymisp thehive4py \
+    requests pymavlink pymisp thehive4py \
     stix2 taxii2-client elasticsearch \
     pyyaml click rich schedule 2>/dev/null || \
 python3 -m pip install \
-    requests pymavlink pyopencti pymisp thehive4py \
+    requests pymavlink pymisp thehive4py \
     stix2 taxii2-client elasticsearch \
     pyyaml click rich schedule
 
@@ -134,7 +134,7 @@ LAB_DIR="$(dirname "$(realpath "$0")")/.."
 python3 -m venv "$LAB_DIR/.venv"
 "$LAB_DIR/.venv/bin/pip" install --quiet \
     requests pymavlink stix2 taxii2-client \
-    pyopencti pymisp elasticsearch pyyaml \
+    pymisp elasticsearch pyyaml \
     click rich schedule
 
 info ""

@@ -23,7 +23,6 @@ services:
     volumes:
       - ./configs/suricata/rules:/etc/suricata/rules:ro
       - suricata-logs:/var/log/suricata
-      - ./configs/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
     command: >
       -i eth0
       --set stats.enabled=yes
@@ -49,7 +48,7 @@ services:
 
   # ── Arkime Full Packet Capture ────────────────────────────────
   arkime:
-    image: ghcr.io/arkime/arkime:main
+    image: mosajjal/arkime:latest
     network_mode: host
     environment:
       ARKIME_ELASTICSEARCH: http://elasticsearch:9200
@@ -66,9 +65,8 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.12.2}
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=true
-      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - "ES_JAVA_OPTS=-Xms4g -Xmx4g"
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
       - xpack.ml.enabled=false
     ulimits:
       memlock:
@@ -85,7 +83,7 @@ services:
     networks:
       - monitor-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
       interval: 30s
       timeout: 10s
       retries: 15
@@ -146,7 +144,7 @@ services:
   # ── ntopng ────────────────────────────────────────────────────
   # Real-time network traffic analysis and flow monitoring
   ntopng:
-    image: ntop/ntopng:stable
+    image: ntop/ntopng:latest
     network_mode: host
     command: >
       --interface=eth0

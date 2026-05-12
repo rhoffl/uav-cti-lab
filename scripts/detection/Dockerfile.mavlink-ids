@@ -1,0 +1,35 @@
+FROM python:3.12
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    libssl-dev \
+    libffi-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+RUN python -m pip install --no-cache-dir \
+    requests \
+    pymavlink \
+    pymisp \
+    thehive4py \
+    stix2 \
+    taxii2-client \
+    elasticsearch \
+    pyyaml \
+    click \
+    rich \
+    schedule
+
+COPY mavlink_ids.py /app/
+
+EXPOSE 14556/udp
+
+ENTRYPOINT ["python", "mavlink_ids.py"]
